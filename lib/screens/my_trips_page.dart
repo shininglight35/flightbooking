@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:intl/intl.dart';
 
 class MyTripsPage extends StatefulWidget {
   const MyTripsPage({super.key});
@@ -8,70 +9,352 @@ class MyTripsPage extends StatefulWidget {
   _MyTripsPageState createState() => _MyTripsPageState();
 }
 
-class _MyTripsPageState extends State<MyTripsPage> {
-  int selectedTab = 0; // 0 = Upcoming, 1 = Past, 2 = Reserved, 3 = Cancelled
+class _MyTripsPageState extends State<MyTripsPage>
+    with SingleTickerProviderStateMixin {
+  late TabController _tabController;
+  final List<String> tabTitles = [
+    "Upcoming Trips",
+    "Past Trips",
+    "Reserved",
+    "Cancelled",
+  ];
+
+  final DateFormat _dateTimeFormatter = DateFormat("yyyy-MM-dd hh:mm a");
+  final DateFormat _displayFormatter = DateFormat("MMM d, yyyy • h:mm a");
+  final DateFormat _displayFormatter2 = DateFormat("MMM d, yyyy");
+  String? paymentMethod;
 
   @override
   void initState() {
     super.initState();
-    // Explicitly set the default tab index when the widget is first created
-    selectedTab = 0; // Ensures it starts on "Upcoming Trips"
+    _tabController = TabController(length: tabTitles.length, vsync: this);
+    _tabController.addListener(() {
+      if (_tabController.indexIsChanging == false && mounted) {
+        setState(() {});
+      }
+    });
   }
-  
-  // --- FUNCTION: Updates the booking status to "cancelled" ---
+
+  @override
+  void dispose() {
+    _tabController.removeListener(() {});
+    _tabController.dispose();
+    super.dispose();
+  }
+
   Future<void> _cancelTrip(String docId) async {
     try {
       await FirebaseFirestore.instance
           .collection('bookings')
           .doc(docId)
           .update({'status': 'cancelled'});
-      
-      // The StreamBuilder will automatically refresh the list, moving the trip to the "Cancelled" tab!
-      print("Trip $docId status updated to 'cancelled'");
+
+      // optional: show snack
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+          content: Text('Trip cancelled'),
+          backgroundColor: Colors.red,
+        ));
+      }
     } catch (e) {
-      print("Error cancelling trip: $e");
+      debugPrint("Error cancelling trip: $e");
+      if (mounted) {
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text('Error cancelling trip: $e')));
+      }
     }
   }
 
-  // --- HELPER FUNCTION: Fetches the real flight date and doc ID ---
   Future<List<Map<String, dynamic>>> _getEnrichedTrips(
       List<QueryDocumentSnapshot<Map<String, dynamic>>> bookingDocs) async {
-    
-    List<Map<String, dynamic>> results = [];
+    final Map<String, List<Map<String, dynamic>>> refsToBookings = {};
+    final List<Map<String, dynamic>> directBookings = [];
 
     for (var doc in bookingDocs) {
-      var data = doc.data();
-      
-      // Store the document ID in the map
-      data['docId'] = doc.id; 
-      
-      DocumentReference? flightRef = data['flightRef'];
-      DateTime realDepartureDate = DateTime.now(); 
+      final data = Map<String, dynamic>.from(doc.data());
+      data['docId'] = doc.id;
+      final String? refStr =
+          (data['flightRef'] is String) ? (data['flightRef'] as String) : null;
 
-      if (flightRef != null) {
-        try {
-          DocumentSnapshot flightSnap = await flightRef.get();
-          
-          if (flightSnap.exists) {
-            Map<String, dynamic> flightData = flightSnap.data() as Map<String, dynamic>;
-            
-            // ⚠️ IMPORTANT: Check the field name in your Firestore Schedule collection
-            var dateField = flightData['departureDate']; 
-
-            if (dateField is Timestamp) {
-              realDepartureDate = dateField.toDate();
-            } else if (dateField is String) {
-              realDepartureDate = DateTime.tryParse(dateField) ?? DateTime.now();
-            }
-          }
-        } catch (e) {
-          print("Error fetching flight details: $e");
-        }
+      if (refStr != null && refStr.trim().isNotEmpty) {
+        final key = refStr.startsWith('/') ? refStr.substring(1) : refStr;
+        refsToBookings.putIfAbsent(key, () => []).add(data);
+      } else {
+        directBookings.add(data);
       }
-      data['realDepartureDate'] = realDepartureDate;
-      results.add(data);
     }
+
+    final Map<String, DocumentSnapshot<Map<String, dynamic>>> fetchedSchedules =
+        {};
+    if (refsToBookings.isNotEmpty) {
+      final futures = refsToBookings.keys.map((path) async {
+        try {
+          final ref = FirebaseFirestore.instance.doc(path);
+          final snap =
+              await ref.get() as DocumentSnapshot<Map<String, dynamic>>;
+          fetchedSchedules[path] = snap;
+        } catch (e) {
+          debugPrint("Failed to fetch schedule at $path — $e");
+        }
+      }).toList();
+
+      await Future.wait(futures);
+    }
+
+    DateTime _extractDateFromBooking(Map<String, dynamic> booking) {
+      // ROUND-TRIP departure date
+      if (booking['departureDate'] != null &&
+          booking['departureTime'] != null) {
+        try {
+          return _dateTimeFormatter.parseLoose(
+            "${booking['departureDate']} ${booking['departureTime']}",
+          );
+        } catch (_) {}
+      }
+
+      // ONE-WAY date
+      if (booking['flightDate'] != null && booking['flightTime'] != null) {
+        try {
+          return _dateTimeFormatter.parseLoose(
+            "${booking['flightDate']} ${booking['flightTime']}",
+          );
+        } catch (_) {}
+      }
+
+      // fallback
+      final ts = booking['timestamp'];
+      if (ts is Timestamp) return ts.toDate();
+
+      return DateTime.now();
+    }
+
+    final List<Map<String, dynamic>> results = [];
+
+    for (var entry in refsToBookings.entries) {
+      final path = entry.key;
+      final schedSnap = fetchedSchedules[path]; // may be null
+      for (var booking in entry.value) {
+        final realDepartureDate = _extractDateFromBooking(booking);
+
+        booking['realDepartureDate'] = realDepartureDate;
+        results.add(booking);
+      }
+    }
+
+    for (var booking in directBookings) {
+      final realDepartureDate = _extractDateFromBooking(booking);
+
+      booking['realDepartureDate'] = realDepartureDate;
+      results.add(booking);
+    }
+
     return results;
+  }
+
+  Future<void> _showPaymentPicker(DateTime reservationDateTime) async {
+    if (reservationDateTime.isBefore(DateTime.now())) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text("This reservation is already past. Cannot confirm."),
+          backgroundColor: Colors.red,
+        ),
+      );
+      return;
+    }
+
+    final methods = [
+      'GCash',
+      'Maya',
+      'Debit Card',
+      'Credit Card',
+      'Cash at Airport'
+    ];
+
+    final selected = await showModalBottomSheet<String>(
+      context: context,
+      builder: (ctx) => Container(
+        padding: const EdgeInsets.all(20),
+        height: 350,
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text("Select Payment Method",
+                style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+            const Divider(),
+            Expanded(
+              child: ListView(
+                children: methods
+                    .map(
+                      (m) => ListTile(
+                        title: Text(m),
+                        onTap: () => Navigator.pop(ctx, m),
+                      ),
+                    )
+                    .toList(),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+
+    if (selected != null) {
+      setState(() => paymentMethod = selected);
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text("Payment successful using $selected"),
+          backgroundColor: Colors.green,
+        ),
+      );
+    }
+  }
+
+  Future<void> _payNow(String docId) async {
+    try {
+      final doc = await FirebaseFirestore.instance
+          .collection('bookings')
+          .doc(docId)
+          .get();
+
+      if (!doc.exists) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text("Booking not found."),
+            backgroundColor: Colors.red,
+          ),
+        );
+        return;
+      }
+
+      final data = doc.data()!;
+      final String flightDate = data['flightDate'] ?? '';
+      final String flightTime = data['flightTime'] ?? '';
+
+      DateTime dep;
+
+      try {
+        dep = DateFormat("yyyy-MM-dd hh:mm a").parse("$flightDate $flightTime");
+      } catch (_) {
+        dep = DateTime.now().add(const Duration(hours: 1));
+      }
+
+      if (dep.isBefore(DateTime.now())) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text("This reservation is already past. Cannot confirm."),
+            backgroundColor: Colors.red,
+          ),
+        );
+        return;
+      }
+
+      await _showPaymentPicker(dep);
+
+      if (paymentMethod == null) {
+        return;
+      }
+
+      await FirebaseFirestore.instance
+          .collection("bookings")
+          .doc(docId)
+          .update({
+        "paymentMethod": paymentMethod,
+        "status": "confirmed",
+        "timestamp": FieldValue.serverTimestamp(),
+      });
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text("Reservation confirmed!"),
+          backgroundColor: Colors.green,
+        ),
+      );
+    } catch (e) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text("Error: $e"),
+          backgroundColor: Colors.red,
+        ),
+      );
+    }
+  }
+
+  Future<bool> _confirmCancel() async {
+    return await showDialog<bool>(
+          context: context,
+          builder: (ctx) => AlertDialog(
+            title: const Text("Cancel Trip"),
+            content: const Text("Are you sure you want to cancel this trip?"),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.of(ctx).pop(false), // user cancels
+                child: const Text("No"),
+              ),
+              TextButton(
+                onPressed: () => Navigator.of(ctx).pop(true), // user confirms
+                child: const Text(
+                  "Yes",
+                  style: TextStyle(color: Colors.red),
+                ),
+              ),
+            ],
+          ),
+        ) ??
+        false;
+  }
+
+  Future<void> _deleteTrip(String docId) async {
+    try {
+      await FirebaseFirestore.instance
+          .collection('bookings')
+          .doc(docId)
+          .delete();
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Trip deleted'),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
+    } catch (e) {
+      debugPrint("Error deleting trip: $e");
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Error deleting trip: $e'),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
+    }
+  }
+
+  Future<bool> _confirmDelete() async {
+    return await showDialog<bool>(
+          context: context,
+          builder: (ctx) => AlertDialog(
+            title: const Text("Delete Trip"),
+            content: const Text(
+                "Are you sure you want to permanently delete this trip?"),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.of(ctx).pop(false),
+                child: const Text("No"),
+              ),
+              TextButton(
+                onPressed: () => Navigator.of(ctx).pop(true),
+                child: const Text(
+                  "Yes",
+                  style: TextStyle(color: Colors.red),
+                ),
+              ),
+            ],
+          ),
+        ) ??
+        false;
   }
 
   @override
@@ -88,32 +371,15 @@ class _MyTripsPageState extends State<MyTripsPage> {
                 style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold),
               ),
             ),
-
-            // Tab buttons
-            SingleChildScrollView(
-              scrollDirection: Axis.horizontal,
-              child: Row(
-                children: [
-                  _buildTabButton("Upcoming Trips", 0),
-                  _buildTabButton("Past Trips", 1),
-                  _buildTabButton("Reserved", 2),
-                  _buildTabButton("Cancelled", 3),
-                ],
-              ),
-            ),
-
+            _buildCustomTabToggle(),
             const SizedBox(height: 20),
-
-            // Trips list with Two-Step Loading
             Expanded(
               child: StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
-                // 1. Listen to Bookings
                 stream: FirebaseFirestore.instance
                     .collection('bookings')
-                    .orderBy('timestamp', descending: true) 
+                    .orderBy('timestamp', descending: true)
                     .snapshots(),
                 builder: (context, snapshot) {
-                  // Loading Bookings...
                   if (snapshot.connectionState == ConnectionState.waiting) {
                     return const Center(child: CircularProgressIndicator());
                   }
@@ -122,166 +388,322 @@ class _MyTripsPageState extends State<MyTripsPage> {
                     return const Center(
                       child: Text(
                         "No Bookings Found",
-                        style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                        style: TextStyle(
+                            fontSize: 18, fontWeight: FontWeight.bold),
                       ),
                     );
                   }
 
-                  // 2. Fetch Real Flight Dates (Async)
                   return FutureBuilder<List<Map<String, dynamic>>>(
                     future: _getEnrichedTrips(snapshot.data!.docs),
                     builder: (context, enrichedSnapshot) {
-                      
-                      // Loading Real Dates...
-                      if (enrichedSnapshot.connectionState == ConnectionState.waiting) {
-                         return const Center(child: CircularProgressIndicator());
+                      if (enrichedSnapshot.connectionState ==
+                          ConnectionState.waiting) {
+                        return const Center(child: CircularProgressIndicator());
                       }
 
                       final allTrips = enrichedSnapshot.data ?? [];
                       final filteredTrips = <Map<String, dynamic>>[];
                       final now = DateTime.now();
 
-                      // 3. Filter Logic (Corrected)
                       for (var trip in allTrips) {
-                        final status = (trip["status"] ?? "").toString().toLowerCase();
-                        final DateTime dep = trip['realDepartureDate']; // The REAL flight date
+                        final status =
+                            (trip["status"] ?? "").toString().toLowerCase();
+                        final DateTime dep =
+                            trip['realDepartureDate'] is DateTime
+                                ? trip['realDepartureDate']
+                                : DateTime.now();
 
-                        switch (selectedTab) {
-                          case 0: // Upcoming
-                            // Must be confirmed AND date must be in the future
-                            if (status == "confirmed" && dep.isBefore(now)) {
-                              filteredTrips.add(trip);
-                            }
-                            break;
-                          case 1: // Past
-                            // Must be confirmed AND date must be in the past
+                        switch (_tabController.index) {
+                          case 0:
                             if (status == "confirmed" && dep.isAfter(now)) {
                               filteredTrips.add(trip);
                             }
                             break;
-                          case 2: // Reserved
+                          case 1:
+                            if (status == "confirmed" && dep.isBefore(now)) {
+                              filteredTrips.add(trip);
+                            }
+                            break;
+                          case 2:
                             if (status == "reserved") filteredTrips.add(trip);
                             break;
-                          case 3: // Cancelled
+                          case 3:
                             if (status == "cancelled") filteredTrips.add(trip);
                             break;
                         }
                       }
 
-                      // Optional: Sort the filtered list by date
                       filteredTrips.sort((a, b) {
-                        DateTime dateA = a['realDepartureDate'];
-                        DateTime dateB = b['realDepartureDate'];
-                        if (selectedTab == 1) return dateB.compareTo(dateA);
+                        DateTime dateA =
+                            a['realDepartureDate'] ?? DateTime.now();
+                        DateTime dateB =
+                            b['realDepartureDate'] ?? DateTime.now();
+                        if (_tabController.index == 1)
+                          return dateB.compareTo(dateA);
                         return dateA.compareTo(dateB);
                       });
 
                       if (filteredTrips.isEmpty) {
                         String message;
-                        switch (selectedTab) {
-                          case 0: message = "No Upcoming Trips"; break;
-                          case 1: message = "No Past Trips"; break;
-                          case 2: message = "No Reserved Trips"; break;
-                          case 3: message = "No Cancelled Trips"; break;
-                          default: message = "No Trips";
+                        switch (_tabController.index) {
+                          case 0:
+                            message = "No Upcoming Trips";
+                            break;
+                          case 1:
+                            message = "No Past Trips";
+                            break;
+                          case 2:
+                            message = "No Reserved Trips";
+                            break;
+                          case 3:
+                            message = "No Cancelled Trips";
+                            break;
+                          default:
+                            message = "No Trips";
                         }
                         return Center(
                           child: Text(
                             message,
-                            style: const TextStyle(fontSize: 18, color: Colors.grey),
+                            style: const TextStyle(
+                                fontSize: 18, color: Colors.grey),
                           ),
                         );
                       }
 
-                      // 4. Display List
                       return ListView.builder(
+                        padding: const EdgeInsets.only(bottom: 24),
                         itemCount: filteredTrips.length,
                         itemBuilder: (context, index) {
                           final trip = filteredTrips[index];
-                          final DateTime dep = trip['realDepartureDate'];
-                          final String docId = trip['docId']; 
-                          
-                          // Logic to show/hide the Cancel button
-                          final bool showCancelButton = selectedTab == 0 || selectedTab == 2;
+                          final DateTime dep =
+                              trip['realDepartureDate'] ?? DateTime.now();
+                          final String docId = trip['docId'] ?? '';
+                          final bool showCancelButton =
+                              (_tabController.index == 0 ||
+                                      _tabController.index == 2) &&
+                                  dep.isAfter(now);
+                          final bool showPayNowButton =
+                              _tabController.index == 2 && dep.isAfter(now);
+                          final bool isRoundTrip =
+                              trip['flightType'] == "Round Trip";
+
+                          final String status =
+                              (trip['status'] ?? '').toString();
+                          final String origin =
+                              (trip['origin'] ?? 'N/A').toString();
+                          final String destination =
+                              (trip['destination'] ?? 'N/A').toString();
+                          final String tClass =
+                              (trip['class'] ?? 'Class').toString();
+                          final String flightType =
+                              (trip['flightType'] ?? 'Flight').toString();
 
                           return Padding(
-                            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                            padding: const EdgeInsets.symmetric(
+                                horizontal: 16, vertical: 8),
                             child: Container(
                               padding: const EdgeInsets.all(16),
-                              height: 120,
+                              height: 150,
                               decoration: BoxDecoration(
                                 color: Colors.grey[200],
                                 borderRadius: BorderRadius.circular(16),
                               ),
                               child: Stack(
                                 children: [
-                                  // TOP LEFT: Route
-                                  Align(
-                                    alignment: Alignment.topLeft,
-                                    child: Text(
-                                      "${trip['origin'] ?? 'N/A'} → ${trip['destination'] ?? 'N/A'}",
-                                      style: const TextStyle(
-                                          fontSize: 20, fontWeight: FontWeight.bold),
-                                    ),
-                                  ),
+                                  Column(
+                                    crossAxisAlignment:
+                                        CrossAxisAlignment.start,
+                                    children: [
+                                      // Top route
+                                      Text(
+                                        "$origin → $destination",
+                                        style: const TextStyle(
+                                          fontSize: 17,
+                                          fontWeight: FontWeight.bold,
+                                        ),
+                                      ),
+                                      const SizedBox(height: 1),
 
-                                  // BOTTOM LEFT: Date, Flight Type, & Class
-                                  Align(
-                                    alignment: Alignment.bottomLeft,
-                                    child: Row(
-                                      children: [
-                                        Icon(Icons.calendar_month, size: 18, color: Colors.grey[800]),
-                                        const SizedBox(width: 4),
-                                        Text(
-                                          "${dep.year}-${dep.month}-${dep.day} • ${trip['flightType'] ?? 'Flight'} • ${trip['class'] ?? 'Class'}",
-                                          style: TextStyle(
-                                            fontSize: 14,
-                                            fontWeight: FontWeight.w500,
+                                      // Departure row
+                                      Row(
+                                        mainAxisSize: MainAxisSize.min,
+                                        children: [
+                                          Icon(
+                                            Icons.calendar_month,
+                                            size: 13,
                                             color: Colors.grey[800],
                                           ),
+                                          const SizedBox(width: 4),
+                                          Text(
+                                            _displayFormatter.format(dep),
+                                            style: TextStyle(
+                                              fontSize: 13,
+                                              fontWeight: FontWeight.w500,
+                                              color: Colors.grey[800],
+                                            ),
+                                          ),
+                                        ],
+                                      ),
+
+                                      // Return route (only if round trip)
+                                      if (isRoundTrip &&
+                                          trip['returnDate'] != null &&
+                                          trip['returnTime'] != null)
+                                        Padding(
+                                          padding:
+                                              const EdgeInsets.only(top: 4),
+                                          child: Text(
+                                            "$destination → $origin",
+                                            style: const TextStyle(
+                                              fontSize: 17,
+                                              fontWeight: FontWeight.bold,
+                                            ),
+                                          ),
                                         ),
+
+                                      // Return date row
+                                      if (isRoundTrip &&
+                                          trip['returnDate'] != null &&
+                                          trip['returnTime'] != null)
+                                        Padding(
+                                          padding:
+                                              const EdgeInsets.only(top: 1),
+                                          child: Row(
+                                            mainAxisSize: MainAxisSize.min,
+                                            children: [
+                                              Icon(
+                                                Icons.refresh,
+                                                size: 13,
+                                                color: Colors.grey[800],
+                                              ),
+                                              const SizedBox(width: 4),
+                                              Text(
+                                                "${_displayFormatter2.format(DateTime.parse(trip['returnDate']))} • ${trip['returnTime']}",
+                                                style: TextStyle(
+                                                  fontSize: 13,
+                                                  color: Colors.grey[800],
+                                                  fontWeight: FontWeight.w500,
+                                                ),
+                                              ),
+                                            ],
+                                          ),
+                                        ),
+
+                                      // Flight type & cabin at the bottom
+                                      Padding(
+                                        padding:
+                                            const EdgeInsets.only(top: 1),
+                                        child: Text(
+                                          "$flightType • $tClass",
+                                          style: TextStyle(
+                                            fontSize: 13,
+                                            color: Colors.grey[800],
+                                            fontWeight: FontWeight.w500,
+                                          ),
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                  Align(
+                                    alignment: Alignment.bottomRight,
+                                    child: Row(
+                                      mainAxisSize: MainAxisSize.min,
+                                      children: [
+                                        if (showPayNowButton)
+                                          TextButton(
+                                            onPressed: () async {
+                                              await _payNow(docId);
+                                            },
+                                            child: Row(
+                                              children: [
+                                                Icon(Icons.payment,
+                                                    color: Colors.blue),
+                                                Text(
+                                                  "PAY NOW",
+                                                  style: TextStyle(
+                                                    color: Colors.blue,
+                                                    fontWeight: FontWeight.w600,
+                                                    fontSize: 14,
+                                                  ),
+                                                ),
+                                              ],
+                                            ),
+                                          ),
+                                        if (showCancelButton)
+                                          TextButton(
+                                            onPressed: () async {
+                                              final confirmed =
+                                                  await _confirmCancel();
+                                              if (confirmed) {
+                                                await _cancelTrip(docId);
+                                              }
+                                            },
+                                            child: Row(
+                                              children: [
+                                                Icon(Icons.cancel,
+                                                    color: Colors.red),
+                                                Text(
+                                                  "CANCEL",
+                                                  style: TextStyle(
+                                                    color: Colors.red,
+                                                    fontWeight: FontWeight.w600,
+                                                    fontSize: 14,
+                                                  ),
+                                                ),
+                                              ],
+                                            ),
+                                          ),
+                                        if ((_tabController.index == 1 ||
+                                            _tabController.index == 3))
+                                          TextButton(
+                                            onPressed: () async {
+                                              final confirmed =
+                                                  await _confirmDelete();
+                                              if (confirmed) {
+                                                await _deleteTrip(docId);
+                                              }
+                                            },
+                                            child: Row(
+                                              children: [
+                                                Icon(Icons.delete,
+                                                    color: Colors.red),
+                                                Text(
+                                                  "DELETE",
+                                                  style: TextStyle(
+                                                    color: Colors.red,
+                                                    fontWeight: FontWeight.w600,
+                                                    fontSize: 14,
+                                                  ),
+                                                ),
+                                              ],
+                                            ),
+                                          ),
                                       ],
                                     ),
                                   ),
-
-                                  // BOTTOM RIGHT: CANCEL BUTTON (Conditional)
-                                  Align(
-                                    alignment: Alignment.bottomRight,
-                                    child: showCancelButton
-                                        ? TextButton(
-                                            onPressed: () => _cancelTrip(docId),
-                                            child: const Text(
-                                              "CANCEL",
-                                              style: TextStyle(
-                                                color: Color.fromARGB(255, 57, 57, 57), 
-                                                fontWeight: FontWeight.w500,
-                                                fontSize: 14,
-                                                decoration: TextDecoration.underline,
-                                              ),
-                                            ),
-                                          )
-                                        // If the trip is Past or Cancelled, show nothing here.
-                                        : const SizedBox.shrink(), 
-                                  ),
-
-                                  // TOP RIGHT: Status Tag
                                   Align(
                                     alignment: Alignment.topRight,
                                     child: Container(
-                                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                                      padding: const EdgeInsets.symmetric(
+                                          horizontal: 8, vertical: 4),
                                       decoration: BoxDecoration(
-                                        color: trip['status'] == 'confirmed' 
-                                            ? Colors.green[100] 
-                                            : (trip['status'] == 'cancelled' ? Colors.red[100] : Colors.orange[100]),
+                                        color: status == 'confirmed'
+                                            ? Colors.green[100]
+                                            : (status == 'cancelled'
+                                                ? Colors.red[100]
+                                                : Colors.orange[100]),
                                         borderRadius: BorderRadius.circular(8),
                                       ),
                                       child: Text(
-                                        (trip['status'] ?? '').toString().toUpperCase(),
+                                        status.toUpperCase(),
                                         style: TextStyle(
                                           fontSize: 10,
-                                          color: trip['status'] == 'confirmed' 
-                                              ? Colors.green[800] 
-                                              : (trip['status'] == 'cancelled' ? Colors.red[800] : Colors.orange[800]),
+                                          color: status == 'confirmed'
+                                              ? Colors.green[800]
+                                              : (status == 'cancelled'
+                                                  ? Colors.red[800]
+                                                  : Colors.orange[800]),
                                           fontWeight: FontWeight.bold,
                                         ),
                                       ),
@@ -304,36 +726,25 @@ class _MyTripsPageState extends State<MyTripsPage> {
     );
   }
 
-  Widget _buildTabButton(String label, int tabIndex) {
-    final selected = selectedTab == tabIndex;
-
+  Widget _buildCustomTabToggle() {
     return Container(
-      width: 160,
-      height: 50,
-      margin: const EdgeInsets.only(left: 16),
+      margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+      padding: const EdgeInsets.all(4),
       decoration: BoxDecoration(
-        color: selected ? const Color(0xFF6C63FF) : Colors.white,
+        color: Colors.blue.shade50,
         borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: Colors.black12),
-        boxShadow: selected ? [BoxShadow(color: Colors.black12, blurRadius: 4, offset: Offset(0,2))] : [],
       ),
-      child: InkWell(
-        borderRadius: BorderRadius.circular(12),
-        onTap: () {
-          setState(() {
-            selectedTab = tabIndex;
-          });
-        },
-        child: Center(
-          child: Text(
-            label,
-            style: TextStyle(
-              fontWeight: FontWeight.bold,
-              fontSize: 14,
-              color: selected ? Colors.white : Colors.black,
-            ),
-          ),
+      child: TabBar(
+        controller: _tabController,
+        indicator: BoxDecoration(
+          color: Colors.blue,
+          borderRadius: BorderRadius.circular(10),
         ),
+        labelColor: Colors.white,
+        unselectedLabelColor: Colors.blue,
+        labelStyle: const TextStyle(fontWeight: FontWeight.w600),
+        indicatorSize: TabBarIndicatorSize.tab,
+        tabs: tabTitles.map((title) => Tab(text: title)).toList(),
       ),
     );
   }
